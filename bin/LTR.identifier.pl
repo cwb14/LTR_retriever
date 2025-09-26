@@ -27,6 +27,8 @@ Version:
 	1.6 Improve TSD reporting. 2015/4/9
 	1.5 Improve TSD reporting. 2015/2/24
 	1.0 2014/02/14
+
+Note (mod): If blastn finds no alignment, do NOT set decision=false; set similarity and age to '?'.
 \n";
 
 my $name=$ARGV[0];
@@ -204,122 +206,130 @@ sub Identifier() {
 		last if $? == 0;
 		}
 
+	# Initialize alignment/estimation variables
 	my ($div, $aln_len, $sim, $mismatch, $age, $cor_adj) = (0,0,1,0,0,0);
 	my ($q_start, $q_end, $qlen, $s_start, $s_end, $slen, $ls, $le, $rs, $re, $ll, $rl)=(0,0,0,0,0,0,0,0,0,0,0,0);
 	my ($nident, $btop, $qseqid, $sseqid) = (0, '', '', '');
 	my $adjust="NO";
-	$decision="false" if $#Blast==0;
 
-	if ($#Blast>0){
-	my $pair=0; #0 indicates no alignment pair seems correct, 1 indicates at least 1 alignment pair seems right
-	my $aln_diff = 0;
-	for (my $i=1; defined $Blast[$i+1]; $i++){
-		$Blast[$i]=~s/^\s+//;
-		$decision="false" if $i>8;
-		last if $i>8;
-		# print "$Blast[$i]\n"; #test
-		# Chr1:106472..118130|Chr1:106522..118080 Chr1:106472..118130|Chr1:106522..118080 1       3085    11559   8475    11559   11559   3085    3084    2955CA129
-
-		($qseqid, $sseqid, $s_start, $s_end, $slen, $q_start, $q_end, $qlen, $aln_len, $nident, $btop) = (split /\s+/,  $Blast[$i]); #btop=Blast trace-back operations, contains alignment info
-		$cor_adj=$info[0]-1;
-		($ls, $le, $rs, $re)=($info[3]-$cor_adj, $info[4]-$cor_adj, $info[6]-$cor_adj, $info[7]-$cor_adj);
-		($q_start, $q_end)=($q_end, $q_start) if $q_start>$q_end;
-		($s_start, $s_end)=($s_end, $s_start) if $s_start>$s_end;
-		($s_start, $s_end, $q_start, $q_end)=($q_start, $q_end, $s_start, $s_end) if $s_start>$q_start;
-		if ($s_start>100 or abs($q_end-length($ltr))>100){ #if LTR alignment shift from the start or end for more than 100bp, it's probably FP
-			$pair=0;
-			next;
+	# --- MOD: do NOT mark false when no BLAST alignment; set similarity/age to '?'
+	if ($#Blast <= 0){
+		# Keep decision as-is; record unknown similarity & age.
+		$info[9]  = "?" unless defined $info[9] && $info[9] ne '';
+		$info[19] = "?" unless defined $info[19] && $info[19] ne '';
+	} else {
+		# We have BLAST pairs to analyze
+		my $pair=0; #0 indicates no alignment pair seems correct, 1 indicates at least 1 alignment pair seems right
+		my $aln_diff = 0;
+		for (my $i=1; defined $Blast[$i+1]; $i++){
+			$Blast[$i]=~s/^\s+//;
+			# (MOD) remove: $decision="false" if $i>8;  -- we won't force false based solely on BLAST rows
+			last if $i>8; #still stop parsing after a handful
+			# Format:
+			# qseqid sseqid sstart send slen qstart qend qlen length nident btop
+			($qseqid, $sseqid, $s_start, $s_end, $slen, $q_start, $q_end, $qlen, $aln_len, $nident, $btop) = (split /\s+/,  $Blast[$i]); # btop contains alignment ops
+			$cor_adj=$info[0]-1;
+			($ls, $le, $rs, $re)=($info[3]-$cor_adj, $info[4]-$cor_adj, $info[6]-$cor_adj, $info[7]-$cor_adj);
+			($q_start, $q_end)=($q_end, $q_start) if $q_start>$q_end;
+			($s_start, $s_end)=($s_end, $s_start) if $s_start>$s_end;
+			($s_start, $s_end, $q_start, $q_end)=($q_start, $q_end, $s_start, $s_end) if $s_start>$q_start;
+			if ($s_start>100 or abs($q_end-length($ltr))>100){ #if LTR alignment shift from the start or end for more than 100bp, it's probably FP
+				$pair=0;
+				next;
 			} else {
-			$pair=1;
-			$aln_diff = abs((($s_start-$s_end)-($q_start-$q_end))); #for paired alignments, calculate the difference of length
-			last;
+				$pair=1;
+				$aln_diff = abs((($s_start-$s_end)-($q_start-$q_end))); #for paired alignments, calculate the difference of length
+				last;
 			}
 		}
-	$decision="false" if $pair==0;
-
-	# count variants
-	$btop =~ s/\d+//g; #remove all matches
-	my $len_snp = length $btop;
-	next unless $len_snp % 2 == 0; #expect string is even length
-	
-	# count transitions and transversions
-	my $n_transition = 0; #A<->G; C<->T
-	my $n_transversion = 0; #A<->C; A<->T; G<->C; G<->T
-	my $n_indel = 0; #[AGCT] <-> -
-	while ($btop =~ s/([ATCG-][ATCG-])//i){
-		my $snp = $1;
-		$n_transition++ if $snp =~ /(AG)|(GA)|(CT)|(TC)/i;
-		$n_transversion++ if $snp =~ /(AC)|(CA)|(AT)|(TA)|(GC)|(CG)|(GT)|(TG)/i;
-		$n_indel++ if $snp =~ /\-/;
-		}
-
-	# estimate evolutionary distance
-	my $tot_len = $n_transition + $n_transversion + $nident; #SNP only, indel not counted
-	$tot_len = $seq_len if $tot_len == 0; #EDTA issue 564
-	my $raw_d = ($n_transition+$n_transversion) / $tot_len; #percent SNP
-	my $JC69_d = 1; #the Jukes-Cantor model K= -3/4*ln(1-4*d/3) adjusts for non-coding sequences, d=$raw_d
-	if ($raw_d < 0.66){ #highly diverged sequence could not be adjusted by the JC69 model
-		$JC69_d = -3/4*log(1-4*$raw_d/3); #log=ln
+		# (MOD) If we didn't find a good pair, do not force false; leave unknown below if needed.
+		if ($pair==0){
+			$info[9]  = "?" unless defined $info[9] && $info[9] ne '';
+			$info[19] = "?" unless defined $info[19] && $info[19] ne '';
 		} else {
-		$JC69_d = $raw_d;
-		}
-	my $P = $n_transition / $tot_len; #fraction of transition
-	my $Q = $n_transversion / $tot_len; #fraction of transversion
-	my $K2P_d = -1/2*log((1-2*$P-$Q)*sqrt(1-2*$Q)); #The Kimura 2-parameter model controls difference b/t transition and transversion rates
-        
-	#estimate divergence time T = K/2u, where K stands for divergence rate, and u is mutation rate (per bp per ya)
-	my $raw_T = sprintf ("%.0f", $raw_d/(2*$miu));
-	my $JC69_T = sprintf ("%.0f", $JC69_d/(2*$miu));
-	my $K2P_T = sprintf ("%.0f", $K2P_d/(2*$miu));
-	$raw_d = sprintf ("%.4f", $raw_d);
-	$JC69_d = sprintf ("%.4f", $JC69_d);
-	$K2P_d = sprintf ("%.4f", $K2P_d);
+			# count variants
+			$btop =~ s/\d+//g; #remove all matches
+			my $len_snp = length $btop;
+			next unless $len_snp % 2 == 0; #expect string is even length
+			
+			# count transitions and transversions
+			my $n_transition = 0; #A<->G; C<->T
+			my $n_transversion = 0; #A<->C; A<->T; G<->C; G<->T
+			my $n_indel = 0; #[AGCT] <-> -
+			while ($btop =~ s/([ATCG-][ATCG-])//i){
+				my $snp = $1;
+				$n_transition++ if $snp =~ /(AG)|(GA)|(CT)|(TC)/i;
+				$n_transversion++ if $snp =~ /(AC)|(CA)|(AT)|(TA)|(GC)|(CG)|(GT)|(TG)/i;
+				$n_indel++ if $snp =~ /\-/;
+			}
 
-	# reassign value to the array
-	($div, $age) = ($K2P_d, $K2P_T) if $model eq "K2P";
-	($div, $age) = ($JC69_d, $JC69_T) if $model eq "JC69";
-	($div, $age) = ($raw_d, $raw_T) if $model eq "PDIST";
-	$info[9]=sprintf ("%.4f", 1-$div);
-	$info[19]=sprintf ("%.0f", $age);
-	#print "$pair\t$K2P_d, $K2P_T, $JC69_d, $JC69_T, $raw_d, $raw_T\n"; #test
+			# estimate evolutionary distance
+			my $tot_len = $n_transition + $n_transversion + $nident; #SNP only, indel not counted
+			$tot_len = $seq_len if $tot_len == 0; #EDTA issue 564
+			my $raw_d = ($n_transition+$n_transversion) / $tot_len; #percent SNP
+			my $JC69_d = 1; #the Jukes-Cantor model K= -3/4*ln(1-4*d/3) adjusts for non-coding sequences, d=$raw_d
+			if ($raw_d < 0.66){ #highly diverged sequence could not be adjusted by the JC69 model
+				$JC69_d = -3/4*log(1-4*$raw_d/3); #log=ln
+			} else {
+				$JC69_d = $raw_d;
+			}
+			my $P = $n_transition / $tot_len; #fraction of transition
+			my $Q = $n_transversion / $tot_len; #fraction of transversion
+			my $K2P_d = -1/2*log((1-2*$P-$Q)*sqrt(1-2*$Q)); #Kimura 2-parameter
 
-	if ($s_end != $le){
-		my $i=1;
-		for (; $i<100; $i++){
-			my $seed="$seq[$s_end-$i-1]"."$seq[$s_end-$i]";
-			if ($seed=~/$motif2/i){
-				$le=$s_end-$i+1;
-				$adjust="3' lLTR";
-				last;
+			#estimate divergence time T = K/2u
+			my $raw_T  = sprintf ("%.0f", $raw_d /(2*$miu));
+			my $JC69_T = sprintf ("%.0f", $JC69_d/(2*$miu));
+			my $K2P_T  = sprintf ("%.0f", $K2P_d /(2*$miu));
+			$raw_d  = sprintf ("%.4f", $raw_d);
+			$JC69_d = sprintf ("%.4f", $JC69_d);
+			$K2P_d  = sprintf ("%.4f", $K2P_d);
+
+			# reassign value to the array
+			($div, $age) = ($K2P_d, $K2P_T) if $model eq "K2P";
+			($div, $age) = ($JC69_d, $JC69_T) if $model eq "JC69";
+			($div, $age) = ($raw_d,  $raw_T)  if $model eq "PDIST";
+			$info[9]=sprintf ("%.4f", 1-$div);
+			$info[19]=sprintf ("%.0f", $age);
+
+			if ($s_end != $le){
+				my $i=1;
+				for (; $i<100; $i++){
+					my $seed="$seq[$s_end-$i-1]"."$seq[$s_end-$i]";
+					if ($seed=~/$motif2/i){
+						$le=$s_end-$i+1;
+						$adjust="3' lLTR";
+						last;
+					}
 				}
 			}
-		}
-	if ($q_start != $rs){
-		my $i=1;
-		for (; $i<100; $i++){
-			my $seed="$seq[$q_start-$i]"."$seq[$q_start-$i+1]";
-			if ($seed=~/$motif1/i){
-				$rs=$q_start+$i-1;
-				$adjust="5' rLTR";
-				last;
+			if ($q_start != $rs){
+				my $i=1;
+				for (; $i<100; $i++){
+					my $seed="$seq[$q_start-$i]"."$seq[$q_start-$i+1]";
+					if ($seed=~/$motif1/i){
+						$rs=$q_start+$i-1;
+						$adjust="5' rLTR";
+						last;
+					}
 				}
 			}
-		}
-	$ll=$le-$ls+1;
-	$rl=$re-$rs+1;
+			$ll=$le-$ls+1;
+			$rl=$re-$rs+1;
 
-##update element information in %info
-	if (abs(abs($ll-$rl)-$aln_diff)<=$length_diff and $s_end<$q_start){
-		$info[3]=$ls+$cor_adj;
-		$info[4]=$le+$cor_adj;
-		$info[5]=$ll;
-		$info[6]=$rs+$cor_adj;
-		$info[7]=$re+$cor_adj;
-		$info[8]=$rl;
-		} else {
-		$adjust="NO";
-		$ll=$rl=$ls=$le=$rs=$re="NA";
-		$decision="false";
+			##update element information in %info
+			if (abs(abs($ll-$rl)-$aln_diff)<=$length_diff and $s_end<$q_start){
+				$info[3]=$ls+$cor_adj;
+				$info[4]=$le+$cor_adj;
+				$info[5]=$ll;
+				$info[6]=$rs+$cor_adj;
+				$info[7]=$re+$cor_adj;
+				$info[8]=$rl;
+			} else {
+				$adjust="NO";
+				$ll=$rl=$ls=$le=$rs=$re="NA";
+				# (MOD) don't force decision=false here; boundaries may still be handled below
+			}
 		}
 	}
 ##Finish correcting internal boundaries
@@ -338,7 +348,7 @@ sub Identifier() {
 		$bond_miss++ while $bond=~/[nN\-]/gi;
 		$decision=~s/raw/false/ and last if $bond_miss>=$boundary_N;
 		$bond_miss=0;
-		}
+	}
 
 ##boundary alignment
 	my ($ac, $bc, $bd, $ad)=(' ',' ',' ',' ');#alignment results between regions
@@ -358,9 +368,9 @@ sub Identifier() {
 
 	if ($ac=~/aligned/i or $bd=~/aligned/i){
 		$decision="false";
-		} else {
+	} else {
 		$decision=~s/raw/pass/;
-		}
+	}
 
 ##identify TSD
 	my ($TSD_ls, $TSD_le, $TSD_rs, $TSD_re)=(0,0,0,0);
@@ -525,6 +535,10 @@ sub Identifier() {
 			}
 		}
 
+	# Ensure similarity and age show '?' if they haven't been computed
+	$info[9]  = "?" unless defined $info[9]  && $info[9]  ne '';
+	$info[19] = "?" unless defined $info[19] && $info[19] ne '';
+
 	#last four variables: strand/superfamily/order/age
 	my $locus = $info[12] eq '-' ? "$chr:$ltr2_e..$ltr1_s" : "$chr:$ltr1_s..$ltr2_e";
 	my $defalse = "$locus\t$decision\tmotif:$motif\tTSD:$TSD\tIN:$internal\t$info[9]\t$info[12]\t$info[18]\t$info[17]\t$info[19]
@@ -537,4 +551,3 @@ sub Identifier() {
 	$scn{$id} = shared_clone([@info]);
 	}
 }
-
